@@ -24,13 +24,14 @@ from tenacity import (
     before_sleep_log,
 )
 
-from config import get_config
+from src.config import get_config
 
 logger = logging.getLogger(__name__)
 
 
 # 股票名称映射（常见股票）
 STOCK_NAME_MAP = {
+    # === A股 ===
     '600519': '贵州茅台',
     '000001': '平安银行',
     '300750': '宁德时代',
@@ -46,6 +47,43 @@ STOCK_NAME_MAP = {
     '600900': '长江电力',
     '601166': '兴业银行',
     '600028': '中国石化',
+
+    # === 美股 ===
+    'AAPL': '苹果',
+    'TSLA': '特斯拉',
+    'MSFT': '微软',
+    'GOOGL': '谷歌A',
+    'GOOG': '谷歌C',
+    'AMZN': '亚马逊',
+    'NVDA': '英伟达',
+    'META': 'Meta',
+    'AMD': 'AMD',
+    'INTC': '英特尔',
+    'BABA': '阿里巴巴',
+    'PDD': '拼多多',
+    'JD': '京东',
+    'BIDU': '百度',
+    'NIO': '蔚来',
+    'XPEV': '小鹏汽车',
+    'LI': '理想汽车',
+    'COIN': 'Coinbase',
+    'MSTR': 'MicroStrategy',
+
+    # === 港股 (5位数字) ===
+    '00700': '腾讯控股',
+    '03690': '美团',
+    '01810': '小米集团',
+    '09988': '阿里巴巴',
+    '09618': '京东集团',
+    '09888': '百度集团',
+    '01024': '快手',
+    '00981': '中芯国际',
+    '02015': '理想汽车',
+    '09868': '小鹏汽车',
+    '00005': '汇丰控股',
+    '01299': '友邦保险',
+    '00941': '中国移动',
+    '00883': '中国海洋石油',
 }
 
 
@@ -605,6 +643,7 @@ class GeminiAnalyzer:
         config = get_config()
         max_retries = config.gemini_max_retries
         base_delay = config.gemini_retry_delay
+<<<<<<< HEAD:analyzer.py
 
         providers = self._get_openai_providers()
         if not providers:
@@ -645,6 +684,31 @@ class GeminiAnalyzer:
                     if response and response.choices and response.choices[0].message.content:
                         return response.choices[0].message.content
 
+=======
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    delay = min(delay, 60)
+                    logger.info(f"[OpenAI] 第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
+                    time.sleep(delay)
+                
+                config = get_config()
+                response = self._openai_client.chat.completions.create(
+                    model=self._current_model_name,
+                    messages=[
+                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=generation_config.get('temperature', config.openai_temperature),
+                    max_tokens=generation_config.get('max_output_tokens', 8192),
+                )
+                
+                if response and response.choices and response.choices[0].message.content:
+                    return response.choices[0].message.content
+                else:
+>>>>>>> main:src/analyzer.py
                     raise ValueError("OpenAI API 返回空响应")
 
                 except Exception as e:
@@ -837,13 +901,14 @@ class GeminiAnalyzer:
             prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
             logger.info(f"[LLM Prompt 预览]\n{prompt_preview}")
             logger.debug(f"=== 完整 Prompt ({len(prompt)}字符) ===\n{prompt}\n=== End Prompt ===")
-            
-            # 设置生成配置
+
+            # 设置生成配置（从配置文件读取温度参数）
+            config = get_config()
             generation_config = {
-                "temperature": 0.7,
+                "temperature": config.gemini_temperature,
                 "max_output_tokens": 8192,
             }
-            
+
             logger.info(f"[LLM调用] 开始调用 Gemini API (temperature={generation_config['temperature']}, max_tokens={generation_config['max_output_tokens']})...")
             
             # 使用带重试的 API 调用
@@ -1028,6 +1093,15 @@ class GeminiAnalyzer:
         else:
             prompt += """
 未搜索到该股票近期的相关新闻。请主要依据技术面数据进行分析。
+"""
+
+        # 注入缺失数据警告
+        if context.get('data_missing'):
+            prompt += """
+⚠️ **数据缺失警告**
+由于接口限制，当前无法获取完整的实时行情和技术指标数据。
+请 **忽略上述表格中的 N/A 数据**，重点依据 **【📰 舆情情报】** 中的新闻进行基本面和情绪面分析。
+在回答技术面问题（如均线、乖离率）时，请直接说明“数据缺失，无法判断”，**严禁编造数据**。
 """
         
         # 明确的输出要求

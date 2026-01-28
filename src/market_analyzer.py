@@ -11,15 +11,17 @@
 """
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 import akshare as ak
 import pandas as pd
+import yfinance as yf
 
-from config import get_config
-from search_service import SearchService
+from src.config import get_config
+from src.search_service import SearchService
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +90,12 @@ class MarketAnalyzer:
     
     # 主要指数代码
     MAIN_INDICES = {
-        '000001': '上证指数',
-        '399001': '深证成指',
-        '399006': '创业板指',
-        '000688': '科创50',
-        '000016': '上证50',
-        '000300': '沪深300',
+        'sh000001': '上证指数',
+        'sz399001': '深证成指',
+        'sz399006': '创业板指',
+        'sh000688': '科创50',
+        'sh000016': '上证50',
+        'sh000300': '沪深300',
     }
     
     def __init__(self, search_service: Optional[SearchService] = None, analyzer=None):
@@ -128,9 +130,22 @@ class MarketAnalyzer:
         self._get_sector_rankings(overview)
         
         # 4. 获取北向资金（可选）
-        self._get_north_flow(overview)
+        # self._get_north_flow(overview)
         
         return overview
+
+    def _call_akshare_with_retry(self, fn, name: str, attempts: int = 2):
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return fn()
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[大盘] {name} 获取失败 (attempt {attempt}/{attempts}): {e}")
+                if attempt < attempts:
+                    time.sleep(min(2 ** attempt, 5))
+        logger.error(f"[大盘] {name} 最终失败: {last_error}")
+        return None
     
     def _get_main_indices(self) -> List[MarketIndex]:
         """获取主要指数实时行情"""
@@ -139,8 +154,8 @@ class MarketAnalyzer:
         try:
             logger.info("[大盘] 获取主要指数实时行情...")
             
-            # 使用 akshare 获取指数行情
-            df = ak.stock_zh_index_spot_em()
+            # 使用 akshare 获取指数行情（新浪财经接口，包含深市指数）
+            df = self._call_akshare_with_retry(ak.stock_zh_index_spot_sina, "指数行情", attempts=2)
             
             if df is not None and not df.empty:
                 for code, name in self.MAIN_INDICES.items():
@@ -169,12 +184,75 @@ class MarketAnalyzer:
                         if index.prev_close > 0:
                             index.amplitude = (index.high - index.low) / index.prev_close * 100
                         indices.append(index)
-                        
-                logger.info(f"[大盘] 获取到 {len(indices)} 个指数行情")
-                
+
+            # 如果 akshare 获取失败或为空，尝试使用 yfinance 兜底
+            if not indices:
+                logger.warning("[大盘] 国内源获取失败，尝试使用 Yfinance 兜底...")
+                indices = self._get_indices_from_yfinance()
+
+            logger.info(f"[大盘] 获取到 {len(indices)} 个指数行情")
+
         except Exception as e:
             logger.error(f"[大盘] 获取指数行情失败: {e}")
-        
+            # 异常时也尝试兜底
+            if not indices:
+                indices = self._get_indices_from_yfinance()
+
+        return indices
+
+    def _get_indices_from_yfinance(self) -> List[MarketIndex]:
+        """从 Yahoo Finance 获取指数行情（兜底方案）"""
+        indices = []
+        # 映射关系：akshare代码 -> yfinance代码
+        yf_mapping = {
+            'sh000001': ('000001.SS', '上证指数'),
+            'sz399001': ('399001.SZ', '深证成指'),
+            'sz399006': ('399006.SZ', '创业板指'),
+            'sh000688': ('000688.SS', '科创50'),
+            'sh000016': ('000016.SS', '上证50'),
+            'sh000300': ('000300.SS', '沪深300'),
+        }
+
+        try:
+            for ak_code, (yf_code, name) in yf_mapping.items():
+                if ak_code not in self.MAIN_INDICES:
+                    continue
+
+                ticker = yf.Ticker(yf_code)
+                try:
+                    hist = ticker.history(period='2d')
+                    if hist.empty:
+                        continue
+
+                    today = hist.iloc[-1]
+                    prev = hist.iloc[-2] if len(hist) > 1 else today
+
+                    price = float(today['Close'])
+                    prev_close = float(prev['Close'])
+                    change = price - prev_close
+                    change_pct = (change / prev_close) * 100 if prev_close else 0
+
+                    index = MarketIndex(
+                        code=ak_code,
+                        name=name,
+                        current=price,
+                        change=change,
+                        change_pct=change_pct,
+                        open=float(today['Open']),
+                        high=float(today['High']),
+                        low=float(today['Low']),
+                        prev_close=prev_close,
+                        volume=float(today['Volume']),
+                        amount=0.0
+                    )
+                    indices.append(index)
+                    logger.info(f"[大盘] Yfinance 成功获取: {name}")
+                except Exception as e:
+                    logger.debug(f"[大盘] Yfinance 获取 {name} 失败: {e}")
+
+        except Exception as e:
+            logger.error(f"[大盘] Yfinance 兜底失败: {e}")
+
         return indices
     
     def _get_market_statistics(self, overview: MarketOverview):
@@ -183,7 +261,7 @@ class MarketAnalyzer:
             logger.info("[大盘] 获取市场涨跌统计...")
             
             # 获取全部A股实时行情
-            df = ak.stock_zh_a_spot_em()
+            df = self._call_akshare_with_retry(ak.stock_zh_a_spot_em, "A股实时行情", attempts=2)
             
             if df is not None and not df.empty:
                 # 涨跌统计
@@ -217,7 +295,7 @@ class MarketAnalyzer:
             logger.info("[大盘] 获取板块涨跌榜...")
             
             # 获取行业板块行情
-            df = ak.stock_board_industry_name_em()
+            df = self._call_akshare_with_retry(ak.stock_board_industry_name_em, "行业板块行情", attempts=2)
             
             if df is not None and not df.empty:
                 change_col = '涨跌幅'
@@ -245,26 +323,26 @@ class MarketAnalyzer:
         except Exception as e:
             logger.error(f"[大盘] 获取板块涨跌榜失败: {e}")
     
-    def _get_north_flow(self, overview: MarketOverview):
-        """获取北向资金流入"""
-        try:
-            logger.info("[大盘] 获取北向资金...")
+    # def _get_north_flow(self, overview: MarketOverview):
+    #     """获取北向资金流入"""
+    #     try:
+    #         logger.info("[大盘] 获取北向资金...")
             
-            # 获取北向资金数据
-            df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+    #         # 获取北向资金数据
+    #         df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
             
-            if df is not None and not df.empty:
-                # 取最新一条数据
-                latest = df.iloc[-1]
-                if '当日净流入' in df.columns:
-                    overview.north_flow = float(latest['当日净流入']) / 1e8  # 转为亿元
-                elif '净流入' in df.columns:
-                    overview.north_flow = float(latest['净流入']) / 1e8
+    #         if df is not None and not df.empty:
+    #             # 取最新一条数据
+    #             latest = df.iloc[-1]
+    #             if '当日净流入' in df.columns:
+    #                 overview.north_flow = float(latest['当日净流入']) / 1e8  # 转为亿元
+    #             elif '净流入' in df.columns:
+    #                 overview.north_flow = float(latest['净流入']) / 1e8
                     
-                logger.info(f"[大盘] 北向资金净流入: {overview.north_flow:.2f}亿")
+    #             logger.info(f"[大盘] 北向资金净流入: {overview.north_flow:.2f}亿")
                 
-        except Exception as e:
-            logger.warning(f"[大盘] 获取北向资金失败: {e}")
+    #     except Exception as e:
+    #         logger.warning(f"[大盘] 获取北向资金失败: {e}")
     
     def search_market_news(self) -> List[Dict]:
         """
@@ -399,7 +477,7 @@ class MarketAnalyzer:
 {overview.date}
 
 ## 主要指数
-{indices_text}
+{indices_text if indices_text else "暂无指数数据（接口异常）"}
 
 ## 市场概况
 - 上涨: {overview.up_count} 家 | 下跌: {overview.down_count} 家 | 平盘: {overview.flat_count} 家
@@ -408,11 +486,13 @@ class MarketAnalyzer:
 - 北向资金: {overview.north_flow:+.2f} 亿元
 
 ## 板块表现
-领涨: {top_sectors_text}
-领跌: {bottom_sectors_text}
+领涨: {top_sectors_text if top_sectors_text else "暂无数据"}
+领跌: {bottom_sectors_text if bottom_sectors_text else "暂无数据"}
 
 ## 市场新闻
 {news_text if news_text else "暂无相关新闻"}
+
+{"注意：由于行情数据获取失败，请主要根据【市场新闻】进行定性分析和总结，不要编造具体的指数点位。" if not indices_text else ""}
 
 ---
 
