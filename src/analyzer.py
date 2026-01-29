@@ -643,7 +643,6 @@ class GeminiAnalyzer:
         config = get_config()
         max_retries = config.gemini_max_retries
         base_delay = config.gemini_retry_delay
-<<<<<<< HEAD:analyzer.py
 
         providers = self._get_openai_providers()
         if not providers:
@@ -677,38 +676,13 @@ class GeminiAnalyzer:
                             {"role": "system", "content": self.SYSTEM_PROMPT},
                             {"role": "user", "content": prompt},
                         ],
-                        temperature=generation_config.get('temperature', 0.7),
+                        temperature=generation_config.get('temperature', config.openai_temperature),
                         max_tokens=generation_config.get('max_output_tokens', 8192),
                     )
 
                     if response and response.choices and response.choices[0].message.content:
                         return response.choices[0].message.content
 
-=======
-        
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    delay = base_delay * (2 ** (attempt - 1))
-                    delay = min(delay, 60)
-                    logger.info(f"[OpenAI] 第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
-                    time.sleep(delay)
-                
-                config = get_config()
-                response = self._openai_client.chat.completions.create(
-                    model=self._current_model_name,
-                    messages=[
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=generation_config.get('temperature', config.openai_temperature),
-                    max_tokens=generation_config.get('max_output_tokens', 8192),
-                )
-                
-                if response and response.choices and response.choices[0].message.content:
-                    return response.choices[0].message.content
-                else:
->>>>>>> main:src/analyzer.py
                     raise ValueError("OpenAI API 返回空响应")
 
                 except Exception as e:
