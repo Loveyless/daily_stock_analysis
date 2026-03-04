@@ -73,6 +73,7 @@ class StockAnalysisPipeline:
             tavily_keys=self.config.tavily_api_keys,
             serpapi_keys=self.config.serpapi_keys,
         )
+        self._search_unavailable_logged = False
         
         logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
         logger.info("已启用趋势分析器 (MA5>MA10>MA20 多头判断)")
@@ -230,13 +231,20 @@ class StockAnalysisPipeline:
                     logger.info(f"[{code}] 情报搜索完成: 共 {total_results} 条结果")
                     logger.debug(f"[{code}] 情报搜索结果:\n{news_context}")
             else:
-                logger.info(f"[{code}] 搜索服务不可用，跳过情报搜索")
+                if not self._search_unavailable_logged:
+                    logger.warning("搜索服务未配置，已禁用舆情分析（后续股票不再重复打印）")
+                    self._search_unavailable_logged = True
+                else:
+                    logger.debug(f"[{code}] 搜索服务不可用，跳过情报搜索")
             
             # Step 5: 获取分析上下文（技术面数据）
             context = self.db.get_analysis_context(code)
             
             if context is None:
-                logger.warning(f"[{code}] 无法获取历史行情数据，将仅基于新闻和实时行情分析")
+                if self.search_service.is_available:
+                    logger.warning(f"[{code}] 无法获取历史行情数据，将仅基于新闻和实时行情分析")
+                else:
+                    logger.warning(f"[{code}] 无法获取历史行情数据，且未启用新闻搜索，将返回保守结论")
                 from datetime import date
                 context = {
                     'code': code,
@@ -255,6 +263,7 @@ class StockAnalysisPipeline:
                 trend_result,
                 stock_name  # 传入股票名称
             )
+            enhanced_context['news_api_enabled'] = bool(self.search_service.is_available)
             
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
             result = self.analyzer.analyze(enhanced_context, news_context=news_context)
@@ -410,10 +419,15 @@ class StockAnalysisPipeline:
             result = self.analyze_stock(code)
             
             if result:
-                logger.info(
-                    f"[{code}] 分析完成: {result.operation_advice}, "
-                    f"评分 {result.sentiment_score}"
-                )
+                if result.success:
+                    logger.info(
+                        f"[{code}] 分析完成: {result.operation_advice}, "
+                        f"评分 {result.sentiment_score}"
+                    )
+                else:
+                    logger.warning(
+                        f"[{code}] 分析降级: {result.error_message or result.analysis_summary}"
+                    )
                 
                 # 单股推送模式（#55）：每分析完一只股票立即推送
                 if single_stock_notify and self.notifier.is_available():
@@ -540,7 +554,7 @@ class StockAnalysisPipeline:
             success_count = sum(1 for code in stock_codes if self.db.has_today_data(code))
             fail_count = len(stock_codes) - success_count
         else:
-            success_count = len(results)
+            success_count = sum(1 for r in results if getattr(r, 'success', True))
             fail_count = len(stock_codes) - success_count
         
         logger.info("===== 分析完成 =====")

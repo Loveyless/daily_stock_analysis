@@ -12,6 +12,7 @@ A股自选股智能分析系统 - AI分析层
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
@@ -496,6 +497,7 @@ class GeminiAnalyzer:
         self._using_fallback = False  # 是否正在使用备选模型
         self._use_openai = False  # 是否使用 OpenAI 兼容 API
         self._openai_client = None  # OpenAI 客户端
+        self._compact_logging = self._is_ci_environment()  # CI 环境压缩日志
         
         # 检查 Gemini API Key 是否有效（过滤占位符）
         gemini_key_valid = self._api_key and not self._api_key.startswith('your_') and len(self._api_key) > 10
@@ -515,6 +517,20 @@ class GeminiAnalyzer:
         # 两者都未配置
         if not self._model and not self._openai_client:
             logger.warning("未配置任何 AI API Key，AI 分析功能将不可用")
+
+    @staticmethod
+    def _is_ci_environment() -> bool:
+        """检测是否在 CI 环境运行（用于压缩日志）"""
+        ci_indicators = (
+            'CI',
+            'GITHUB_ACTIONS',
+            'GITLAB_CI',
+            'JENKINS_URL',
+            'TRAVIS',
+            'CIRCLECI',
+            'CODEBUILD_BUILD_ID',
+        )
+        return any(os.getenv(var) for var in ci_indicators)
     
     def _init_openai_fallback(self) -> None:
         """
@@ -883,12 +899,8 @@ class GeminiAnalyzer:
         """
         code = context.get('code', 'Unknown')
         config = get_config()
-        
-        # 请求前增加延时（防止连续请求触发限流）
-        request_delay = config.gemini_request_delay
-        if request_delay > 0:
-            logger.debug(f"[LLM] 请求前等待 {request_delay:.1f} 秒...")
-            time.sleep(request_delay)
+        news_api_enabled = bool(context.get('news_api_enabled', True))
+        has_usable_news = news_api_enabled and self._has_usable_news_context(news_context)
         
         # 优先从上下文获取股票名称（由 main.py 传入）
         name = context.get('stock_name')
@@ -899,6 +911,11 @@ class GeminiAnalyzer:
             else:
                 # 最后从映射表获取
                 name = STOCK_NAME_MAP.get(code, f'股票{code}')
+
+        # 数据硬短路：技术面缺失且无有效新闻时，直接返回保守结果，避免无意义 LLM 调用
+        if context.get('data_missing') and not has_usable_news:
+            logger.warning(f"[LLM跳过] {name}({code}) 技术面和新闻均不可用，跳过 AI 分析")
+            return self._build_data_unavailable_result(code, name)
         
         # 如果模型不可用，返回默认结果
         if not self.is_available():
@@ -914,10 +931,21 @@ class GeminiAnalyzer:
                 success=False,
                 error_message='Gemini API Key 未配置',
             )
+
+        # 请求前增加延时（防止连续请求触发限流）
+        request_delay = config.gemini_request_delay
+        if request_delay > 0:
+            logger.debug(f"[LLM] 请求前等待 {request_delay:.1f} 秒...")
+            time.sleep(request_delay)
         
         try:
             # 格式化输入（包含技术面数据和新闻）
-            prompt = self._format_prompt(context, name, news_context)
+            prompt = self._format_prompt(
+                context,
+                name,
+                news_context if has_usable_news else None,
+                news_api_enabled=news_api_enabled
+            )
             
             # 获取模型名称
             model_name = getattr(self, '_current_model_name', None)
@@ -929,11 +957,14 @@ class GeminiAnalyzer:
             logger.info(f"========== AI 分析 {name}({code}) ==========")
             logger.info(f"[LLM配置] 模型: {model_name}")
             logger.info(f"[LLM配置] Prompt 长度: {len(prompt)} 字符")
-            logger.info(f"[LLM配置] 是否包含新闻: {'是' if news_context else '否'}")
+            logger.info(f"[LLM配置] 是否包含新闻: {'是' if has_usable_news else '否'}")
             
             # 记录完整 prompt 到日志（INFO级别记录摘要，DEBUG记录完整）
             prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
-            logger.info(f"[LLM Prompt 预览]\n{prompt_preview}")
+            if self._compact_logging:
+                logger.debug(f"[LLM Prompt 预览]\n{prompt_preview}")
+            else:
+                logger.info(f"[LLM Prompt 预览]\n{prompt_preview}")
             logger.debug(f"=== 完整 Prompt ({len(prompt)}字符) ===\n{prompt}\n=== End Prompt ===")
 
             # 设置生成配置（从配置文件读取温度参数）
@@ -955,13 +986,18 @@ class GeminiAnalyzer:
             
             # 记录响应预览（INFO级别）和完整响应（DEBUG级别）
             response_preview = response_text[:300] + "..." if len(response_text) > 300 else response_text
-            logger.info(f"[LLM返回 预览]\n{response_preview}")
+            if self._compact_logging:
+                logger.debug(f"[LLM返回 预览]\n{response_preview}")
+            else:
+                logger.info(f"[LLM返回 预览]\n{response_preview}")
             logger.debug(f"=== Gemini 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ===")
             
             # 解析响应
             result = self._parse_response(response_text, code, name)
             result.raw_response = response_text
-            result.search_performed = bool(news_context)
+            if not news_api_enabled:
+                self._strip_news_fields(result)
+            result.search_performed = has_usable_news
             
             logger.info(f"[LLM解析] {name}({code}) 分析完成: {result.trend_prediction}, 评分 {result.sentiment_score}")
             
@@ -981,12 +1017,58 @@ class GeminiAnalyzer:
                 success=False,
                 error_message=str(e),
             )
+
+    @staticmethod
+    def _has_usable_news_context(news_context: Optional[str]) -> bool:
+        """判断新闻上下文是否包含可用信息（过滤空字符串和占位文案）"""
+        if not news_context:
+            return False
+        text = news_context.strip()
+        if not text:
+            return False
+        no_news_markers = (
+            '未搜索到',
+            '暂无相关新闻',
+            '未找到相关',
+            '无相关新闻',
+            '未检索到',
+            'No results',
+        )
+        return not any(marker in text for marker in no_news_markers)
+
+    @staticmethod
+    def _build_data_unavailable_result(code: str, name: str) -> AnalysisResult:
+        """构造数据不可用时的保守结果"""
+        return AnalysisResult(
+            code=code,
+            name=name,
+            sentiment_score=50,
+            trend_prediction='无法判断',
+            operation_advice='观望',
+            confidence_level='低',
+            analysis_summary='技术面与新闻情报均缺失，已跳过 AI 分析，建议观望。',
+            key_points='缺少行情与新闻输入，禁止输出买卖点位',
+            risk_warning='数据源不可用，请恢复数据后再分析',
+            success=False,
+            error_message='数据不足（无技术面、无有效新闻），已跳过 AI 调用',
+            data_sources='无可用行情与新闻',
+        )
+
+    @staticmethod
+    def _strip_news_fields(result: AnalysisResult) -> None:
+        """移除舆情相关字段（未启用新闻 API 时使用）"""
+        result.news_summary = ''
+        result.market_sentiment = ''
+        result.hot_topics = ''
+        if isinstance(result.dashboard, dict):
+            result.dashboard.pop('intelligence', None)
     
     def _format_prompt(
         self, 
         context: Dict[str, Any], 
         name: str,
-        news_context: Optional[str] = None
+        news_context: Optional[str] = None,
+        news_api_enabled: bool = True
     ) -> str:
         """
         格式化分析提示词（决策仪表盘 v2.0）
@@ -999,6 +1081,7 @@ class GeminiAnalyzer:
             news_context: 预先搜索的新闻内容
         """
         code = context.get('code', 'Unknown')
+        usable_news_context = news_context if self._has_usable_news_context(news_context) else None
         
         # 优先使用上下文中的股票名称（从 realtime_quote 获取）
         stock_name = context.get('stock_name', name)
@@ -1107,35 +1190,55 @@ class GeminiAnalyzer:
 - 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
 """
         
-        # 添加新闻搜索结果（重点区域）
-        prompt += """
+        if news_api_enabled:
+            # 添加新闻搜索结果（重点区域）
+            prompt += """
 ---
 
 ## 📰 舆情情报
 """
-        if news_context:
-            prompt += f"""
+            if usable_news_context:
+                prompt += f"""
 以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
 1. 🚨 **风险警报**：减持、处罚、利空
 2. 🎯 **利好催化**：业绩、合同、政策
 3. 📊 **业绩预期**：年报预告、业绩快报
 
 ```
-{news_context}
+{usable_news_context}
 ```
 """
-        else:
-            prompt += """
+            else:
+                if context.get('data_missing'):
+                    prompt += """
+未搜索到该股票近期相关新闻，且技术面数据缺失。
+请仅输出“数据不足，建议观望”，不要给出买卖价位或技术指标判断。
+"""
+                else:
+                    prompt += """
 未搜索到该股票近期的相关新闻。请主要依据技术面数据进行分析。
 """
 
         # 注入缺失数据警告
         if context.get('data_missing'):
-            prompt += """
+            if usable_news_context:
+                prompt += """
 ⚠️ **数据缺失警告**
 由于接口限制，当前无法获取完整的实时行情和技术指标数据。
 请 **忽略上述表格中的 N/A 数据**，重点依据 **【📰 舆情情报】** 中的新闻进行基本面和情绪面分析。
 在回答技术面问题（如均线、乖离率）时，请直接说明“数据缺失，无法判断”，**严禁编造数据**。
+"""
+            elif news_api_enabled:
+                prompt += """
+⚠️ **数据缺失警告**
+当前技术面与新闻输入均不足，请直接给出“数据不足，建议观望”。
+严禁编造技术指标、严禁给出具体买卖价位。
+"""
+            else:
+                prompt += """
+⚠️ **数据缺失警告**
+当前技术面数据不足，且未启用新闻检索，请直接给出“数据不足，建议观望”。
+严禁编造技术指标、严禁给出具体买卖价位。
 """
         
         # 明确的输出要求
@@ -1151,8 +1254,17 @@ class GeminiAnalyzer:
 2. ❓ 当前乖离率是否在安全范围内（<5%）？—— 超过5%必须标注"严禁追高"
 3. ❓ 量能是否配合（缩量回调/放量突破）？
 4. ❓ 筹码结构是否健康？
+"""
+        if news_api_enabled:
+            prompt += """
 5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
+"""
+        else:
+            prompt += """
+5. ❓ 未启用新闻检索，舆情字段（news_summary/market_sentiment/hot_topics）必须输出为空字符串。
+"""
 
+        prompt += """
 ### 决策仪表盘要求：
 - **核心结论**：一句话说清该买/该卖/该等
 - **持仓分类建议**：空仓者怎么做 vs 持仓者怎么做
@@ -1290,45 +1402,21 @@ class GeminiAnalyzer:
         code: str, 
         name: str
     ) -> AnalysisResult:
-        """从纯文本响应中尽可能提取分析信息"""
-        # 尝试识别关键词来判断情绪
-        sentiment_score = 50
-        trend = '震荡'
-        advice = '持有'
-        
-        text_lower = response_text.lower()
-        
-        # 简单的情绪识别
-        positive_keywords = ['看多', '买入', '上涨', '突破', '强势', '利好', '加仓', 'bullish', 'buy']
-        negative_keywords = ['看空', '卖出', '下跌', '跌破', '弱势', '利空', '减仓', 'bearish', 'sell']
-        
-        positive_count = sum(1 for kw in positive_keywords if kw in text_lower)
-        negative_count = sum(1 for kw in negative_keywords if kw in text_lower)
-        
-        if positive_count > negative_count + 1:
-            sentiment_score = 65
-            trend = '看多'
-            advice = '买入'
-        elif negative_count > positive_count + 1:
-            sentiment_score = 35
-            trend = '看空'
-            advice = '卖出'
-        
-        # 截取前500字符作为摘要
-        summary = response_text[:500] if response_text else '无分析结果'
-        
+        """从纯文本响应降级为保守结果，避免误导性交易建议"""
+        summary = response_text[:500] if response_text else '模型返回非结构化内容'
         return AnalysisResult(
             code=code,
             name=name,
-            sentiment_score=sentiment_score,
-            trend_prediction=trend,
-            operation_advice=advice,
+            sentiment_score=50,
+            trend_prediction='无法判断',
+            operation_advice='观望',
             confidence_level='低',
-            analysis_summary=summary,
-            key_points='JSON解析失败，仅供参考',
-            risk_warning='分析结果可能不准确，建议结合其他信息判断',
+            analysis_summary=f'模型输出未通过 JSON 校验，已降级为保守结论。原文摘要：{summary}',
+            key_points='输出格式异常，未采纳模型买卖建议',
+            risk_warning='AI 输出解析失败，请人工复核或重试',
             raw_response=response_text,
-            success=True,
+            success=False,
+            error_message='JSON解析失败，已降级为安全结果',
         )
     
     def batch_analyze(
