@@ -262,6 +262,11 @@ class NotificationService:
             names.append("钉钉会话")
         return ', '.join(names)
 
+    @staticmethod
+    def _should_show_news_analysis(result: AnalysisResult) -> bool:
+        """仅在实际执行过新闻搜索时展示舆情分析"""
+        return bool(getattr(result, 'search_performed', False))
+
     def _has_context_channel(self) -> bool:
         """判断是否存在基于消息上下文的临时渠道（如钉钉会话、飞书会话）"""
         return (
@@ -449,11 +454,12 @@ class NotificationService:
             
             # 消息面/情绪面
             news_lines = []
-            if result.news_summary:
+            show_news = self._should_show_news_analysis(result)
+            if show_news and result.news_summary:
                 news_lines.append(f"**新闻摘要**：{result.news_summary}")
-            if hasattr(result, 'market_sentiment') and result.market_sentiment:
+            if show_news and hasattr(result, 'market_sentiment') and result.market_sentiment:
                 news_lines.append(f"**市场情绪**：{result.market_sentiment}")
-            if hasattr(result, 'hot_topics') and result.hot_topics:
+            if show_news and hasattr(result, 'hot_topics') and result.hot_topics:
                 news_lines.append(f"**相关热点**：{result.hot_topics}")
             if news_lines:
                 report_lines.extend([
@@ -586,6 +592,7 @@ class NotificationService:
         for result in sorted_results:
             signal_text, signal_emoji, signal_tag = self._get_signal_level(result)
             dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
+            show_news = self._should_show_news_analysis(result)
             
             # 股票名称（优先使用 dashboard 或 result 中的名称）
             stock_name = result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}'
@@ -596,7 +603,7 @@ class NotificationService:
             ])
             
             # ========== 舆情与基本面概览（放在最前面）==========
-            intel = dashboard.get('intelligence', {}) if dashboard else {}
+            intel = dashboard.get('intelligence', {}) if (dashboard and show_news) else {}
             if intel:
                 report_lines.extend([
                     "### 📰 重要信息速览",
@@ -791,7 +798,7 @@ class NotificationService:
                     report_lines.append("")
                 
                 # 消息面
-                if result.news_summary:
+                if show_news and result.news_summary:
                     report_lines.extend([
                         "### 📰 消息面",
                         f"{result.news_summary}",
@@ -843,9 +850,10 @@ class NotificationService:
         for result in sorted_results:
             signal_text, signal_emoji, _ = self._get_signal_level(result)
             dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
+            show_news = self._should_show_news_analysis(result)
             core = dashboard.get('core_conclusion', {}) if dashboard else {}
             battle = dashboard.get('battle_plan', {}) if dashboard else {}
-            intel = dashboard.get('intelligence', {}) if dashboard else {}
+            intel = dashboard.get('intelligence', {}) if (dashboard and show_news) else {}
             
             # 股票名称
             stock_name = result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}'
@@ -1025,9 +1033,10 @@ class NotificationService:
         report_date = datetime.now().strftime('%Y-%m-%d %H:%M')
         signal_text, signal_emoji, _ = self._get_signal_level(result)
         dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
+        show_news = self._should_show_news_analysis(result)
         core = dashboard.get('core_conclusion', {}) if dashboard else {}
         battle = dashboard.get('battle_plan', {}) if dashboard else {}
-        intel = dashboard.get('intelligence', {}) if dashboard else {}
+        intel = dashboard.get('intelligence', {}) if (dashboard and show_news) else {}
         
         # 股票名称
         stock_name = result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}'
