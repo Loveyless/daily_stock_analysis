@@ -37,7 +37,7 @@ from sqlalchemy.orm import (
     sessionmaker,
     Session,
 )
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from src.config import get_config
 
@@ -335,68 +335,64 @@ class DatabaseManager:
             logger.warning(f"保存数据为空，跳过 {code}")
             return 0
         
-        saved_count = 0
-        
         with self.get_session() as session:
             try:
+                # 先按日期去重（同一批数据中重复日期保留最后一条）
+                dedup_records: Dict[date, Dict[str, Any]] = {}
                 for _, row in df.iterrows():
-                    # 解析日期
-                    row_date = row.get('date')
-                    if isinstance(row_date, str):
-                        row_date = datetime.strptime(row_date, '%Y-%m-%d').date()
-                    elif isinstance(row_date, datetime):
-                        row_date = row_date.date()
-                    elif isinstance(row_date, pd.Timestamp):
-                        row_date = row_date.date()
-                    
-                    # 检查是否已存在
-                    existing = session.execute(
-                        select(StockDaily).where(
-                            and_(
-                                StockDaily.code == code,
-                                StockDaily.date == row_date
-                            )
-                        )
-                    ).scalar_one_or_none()
-                    
-                    if existing:
-                        # 更新现有记录
-                        existing.open = row.get('open')
-                        existing.high = row.get('high')
-                        existing.low = row.get('low')
-                        existing.close = row.get('close')
-                        existing.volume = row.get('volume')
-                        existing.amount = row.get('amount')
-                        existing.pct_chg = row.get('pct_chg')
-                        existing.ma5 = row.get('ma5')
-                        existing.ma10 = row.get('ma10')
-                        existing.ma20 = row.get('ma20')
-                        existing.volume_ratio = row.get('volume_ratio')
-                        existing.data_source = data_source
-                        existing.updated_at = datetime.now()
-                    else:
-                        # 创建新记录
-                        record = StockDaily(
-                            code=code,
-                            date=row_date,
-                            open=row.get('open'),
-                            high=row.get('high'),
-                            low=row.get('low'),
-                            close=row.get('close'),
-                            volume=row.get('volume'),
-                            amount=row.get('amount'),
-                            pct_chg=row.get('pct_chg'),
-                            ma5=row.get('ma5'),
-                            ma10=row.get('ma10'),
-                            ma20=row.get('ma20'),
-                            volume_ratio=row.get('volume_ratio'),
-                            data_source=data_source,
-                        )
-                        session.add(record)
-                        saved_count += 1
-                
+                    row_date_raw = row.get('date')
+                    row_date_parsed = pd.to_datetime(row_date_raw, errors='coerce')
+                    if pd.isna(row_date_parsed):
+                        logger.warning(f"跳过无效日期数据: {row_date_raw}")
+                        continue
+
+                    row_date = row_date_parsed.date()
+                    dedup_records[row_date] = {
+                        'code': code,
+                        'date': row_date,
+                        'open': row.get('open'),
+                        'high': row.get('high'),
+                        'low': row.get('low'),
+                        'close': row.get('close'),
+                        'volume': row.get('volume'),
+                        'amount': row.get('amount'),
+                        'pct_chg': row.get('pct_chg'),
+                        'ma5': row.get('ma5'),
+                        'ma10': row.get('ma10'),
+                        'ma20': row.get('ma20'),
+                        'volume_ratio': row.get('volume_ratio'),
+                        'data_source': data_source,
+                    }
+
+                if not dedup_records:
+                    logger.warning(f"保存 {code} 数据失败：有效行数为 0")
+                    return 0
+
+                rows = list(dedup_records.values())
+                insert_stmt = sqlite_insert(StockDaily).values(rows)
+                upsert_stmt = insert_stmt.on_conflict_do_update(
+                    index_elements=['code', 'date'],
+                    set_={
+                        'open': insert_stmt.excluded.open,
+                        'high': insert_stmt.excluded.high,
+                        'low': insert_stmt.excluded.low,
+                        'close': insert_stmt.excluded.close,
+                        'volume': insert_stmt.excluded.volume,
+                        'amount': insert_stmt.excluded.amount,
+                        'pct_chg': insert_stmt.excluded.pct_chg,
+                        'ma5': insert_stmt.excluded.ma5,
+                        'ma10': insert_stmt.excluded.ma10,
+                        'ma20': insert_stmt.excluded.ma20,
+                        'volume_ratio': insert_stmt.excluded.volume_ratio,
+                        'data_source': insert_stmt.excluded.data_source,
+                        'updated_at': datetime.now(),
+                    }
+                )
+
+                session.execute(upsert_stmt)
                 session.commit()
-                logger.info(f"保存 {code} 数据成功，新增 {saved_count} 条")
+                saved_count = len(rows)
+                logger.info(f"保存 {code} 数据成功，写入 {saved_count} 条（UPSERT）")
                 
             except Exception as e:
                 session.rollback()
