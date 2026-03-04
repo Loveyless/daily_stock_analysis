@@ -232,18 +232,13 @@ class DataFetcherManager:
     职责：
     1. 管理多个数据源（按优先级排序）
     2. 自动故障切换（Failover）
-    3. 运行时熔断：连续失败的数据源自动跳过
-    4. 提供统一的数据获取接口
+    3. 提供统一的数据获取接口
 
     切换策略：
     - 优先使用高优先级数据源
     - 失败后自动切换到下一个
-    - 连续失败 N 次的数据源在本轮自动跳过（运行时熔断）
     - 所有数据源都失败时抛出异常
     """
-
-    # 运行时熔断阈值：连续失败达到此次数后，本次运行期间跳过该数据源
-    RUNTIME_FAILURE_THRESHOLD = 2
 
     def __init__(self, fetchers: Optional[List[BaseFetcher]] = None):
         """
@@ -253,8 +248,6 @@ class DataFetcherManager:
             fetchers: 数据源列表（可选，默认按优先级自动创建）
         """
         self._fetchers: List[BaseFetcher] = []
-        # 运行时熔断计数器：{fetcher_name: consecutive_failures}
-        self._runtime_failures: Dict[str, int] = {}
 
         if fetchers:
             # 按优先级排序
@@ -345,14 +338,12 @@ class DataFetcherManager:
         days: int = 30
     ) -> Tuple[pd.DataFrame, str]:
         """
-        获取日线数据（自动切换数据源 + 运行时熔断）
+        获取日线数据（自动切换数据源）
 
         故障切换策略：
         1. 从最高优先级数据源开始尝试
-        2. 连续失败达到阈值的数据源自动跳过（运行时熔断）
-        3. 捕获异常后自动切换到下一个
-        4. 成功后重置该数据源的失败计数
-        5. 所有数据源失败后抛出详细异常
+        2. 捕获异常后自动切换到下一个
+        3. 所有数据源失败后抛出详细异常
 
         Args:
             stock_code: 股票代码
@@ -369,13 +360,6 @@ class DataFetcherManager:
         errors = []
 
         for fetcher in self._fetchers:
-            # 运行时熔断：连续失败次数达到阈值，跳过
-            fail_count = self._runtime_failures.get(fetcher.name, 0)
-            if fail_count >= self.RUNTIME_FAILURE_THRESHOLD:
-                logger.debug(f"[{fetcher.name}] 已熔断（连续失败 {fail_count} 次），跳过")
-                errors.append(f"[{fetcher.name}] 已熔断跳过（连续失败 {fail_count} 次）")
-                continue
-
             try:
                 logger.info(f"尝试使用 [{fetcher.name}] 获取 {stock_code}...")
                 df = fetcher.get_daily_data(
@@ -386,8 +370,6 @@ class DataFetcherManager:
                 )
 
                 if df is not None and not df.empty:
-                    # 成功：重置该数据源的失败计数
-                    self._runtime_failures[fetcher.name] = 0
                     logger.info(f"[{fetcher.name}] 成功获取 {stock_code}")
                     return df, fetcher.name
 
@@ -395,11 +377,6 @@ class DataFetcherManager:
                 error_msg = f"[{fetcher.name}] 失败: {str(e)}"
                 logger.warning(error_msg)
                 errors.append(error_msg)
-                # 累计失败次数
-                self._runtime_failures[fetcher.name] = fail_count + 1
-                new_count = self._runtime_failures[fetcher.name]
-                if new_count >= self.RUNTIME_FAILURE_THRESHOLD:
-                    logger.warning(f"[{fetcher.name}] 连续失败 {new_count} 次，后续将跳过")
                 continue
 
         # 所有数据源都失败
