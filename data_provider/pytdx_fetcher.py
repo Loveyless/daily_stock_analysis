@@ -66,6 +66,9 @@ class PytdxFetcher(BaseFetcher):
         ("59.173.18.140", 7709),   # 武汉
         ("180.153.39.51", 7709),   # 杭州
     ]
+
+    # 每个服务器的连接超时（秒）。降低以减少全部失败时的等待时间。
+    CONNECT_TIMEOUT = 3
     
     def __init__(self, hosts: Optional[List[Tuple[str, int]]] = None):
         """
@@ -122,7 +125,7 @@ class PytdxFetcher(BaseFetcher):
                 host, port = self._hosts[host_idx]
                 
                 try:
-                    if api.connect(host, port, time_out=5):
+                    if api.connect(host, port, time_out=self.CONNECT_TIMEOUT):
                         connected = True
                         self._current_host_idx = host_idx
                         logger.debug(f"Pytdx 连接成功: {host}:{port}")
@@ -174,8 +177,8 @@ class PytdxFetcher(BaseFetcher):
             return 0, code  # 深圳
     
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(1),  # 不重试（服务器全不可达时重试无意义，交给运行时熔断器处理）
+        wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type((ConnectionError, TimeoutError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )

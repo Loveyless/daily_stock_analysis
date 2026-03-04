@@ -228,27 +228,34 @@ class BaseFetcher(ABC):
 class DataFetcherManager:
     """
     数据源策略管理器
-    
+
     职责：
     1. 管理多个数据源（按优先级排序）
     2. 自动故障切换（Failover）
-    3. 提供统一的数据获取接口
-    
+    3. 运行时熔断：连续失败的数据源自动跳过
+    4. 提供统一的数据获取接口
+
     切换策略：
     - 优先使用高优先级数据源
     - 失败后自动切换到下一个
+    - 连续失败 N 次的数据源在本轮自动跳过（运行时熔断）
     - 所有数据源都失败时抛出异常
     """
-    
+
+    # 运行时熔断阈值：连续失败达到此次数后，本次运行期间跳过该数据源
+    RUNTIME_FAILURE_THRESHOLD = 2
+
     def __init__(self, fetchers: Optional[List[BaseFetcher]] = None):
         """
         初始化管理器
-        
+
         Args:
             fetchers: 数据源列表（可选，默认按优先级自动创建）
         """
         self._fetchers: List[BaseFetcher] = []
-        
+        # 运行时熔断计数器：{fetcher_name: consecutive_failures}
+        self._runtime_failures: Dict[str, int] = {}
+
         if fetchers:
             # 按优先级排序
             self._fetchers = sorted(fetchers, key=lambda f: f.priority)
@@ -256,54 +263,74 @@ class DataFetcherManager:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
     
+    @staticmethod
+    def _is_ci_environment() -> bool:
+        """检测是否在 CI/海外云环境中运行"""
+        import os
+        ci_indicators = ['CI', 'GITHUB_ACTIONS', 'GITLAB_CI', 'JENKINS_URL',
+                         'TRAVIS', 'CIRCLECI', 'CODEBUILD_BUILD_ID']
+        return any(os.getenv(var) for var in ci_indicators)
+
     def _init_default_fetchers(self) -> None:
         """
         初始化默认数据源列表
 
-        优先级动态调整逻辑：
-        - 如果配置了 TUSHARE_TOKEN：Tushare 优先级提升为 0（最高）
-        - 否则按默认优先级：
-          0. EfinanceFetcher (Priority 0) - 最高优先级
-          1. AkshareFetcher (Priority 1)
-          2. PytdxFetcher (Priority 2) - 通达信
-          2. TushareFetcher (Priority 2)
-          3. BaostockFetcher (Priority 3)
-          4. YfinanceFetcher (Priority 4)
+        优先级逻辑：
+        1. 如果设置了 DATA_SOURCE_PRIORITY，只启用列出的数据源（排他模式）
+           例如: DATA_SOURCE_PRIORITY=baostock  → 只用 baostock
+        2. 未设置时，CI 环境自动跳过 Pytdx（通达信服务器在境内不可达）
+        3. 未设置时，按默认优先级加载全部数据源
         """
+        import os
         from .efinance_fetcher import EfinanceFetcher
         from .akshare_fetcher import AkshareFetcher
         from .tushare_fetcher import TushareFetcher
         from .pytdx_fetcher import PytdxFetcher
         from .baostock_fetcher import BaostockFetcher
         from .yfinance_fetcher import YfinanceFetcher
-        from src.config import get_config
 
-        config = get_config()
+        # 名称 → 工厂函数（延迟创建，避免用不到的数据源浪费初始化开销）
+        fetcher_factories = {
+            'efinance': EfinanceFetcher,
+            'akshare': AkshareFetcher,
+            'tushare': TushareFetcher,
+            'pytdx': PytdxFetcher,
+            'baostock': BaostockFetcher,
+            'yfinance': YfinanceFetcher,
+        }
 
-        # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
-        efinance = EfinanceFetcher()
-        akshare = AkshareFetcher()
-        tushare = TushareFetcher()  # 会根据 Token 配置自动调整优先级
-        pytdx = PytdxFetcher()      # 通达信数据源
-        baostock = BaostockFetcher()
-        yfinance = YfinanceFetcher()
+        custom_priority = os.getenv('DATA_SOURCE_PRIORITY', '').strip()
 
-        # 初始化数据源列表
-        self._fetchers = [
-            efinance,
-            akshare,
-            tushare,
-            pytdx,
-            baostock,
-            yfinance,
-        ]
+        if custom_priority:
+            # 排他模式：只启用用户指定的数据源
+            self._fetchers = []
+            for name in custom_priority.split(','):
+                name = name.strip().lower()
+                if name in fetcher_factories:
+                    self._fetchers.append(fetcher_factories[name]())
+                else:
+                    logger.warning(f"DATA_SOURCE_PRIORITY 中的 '{name}' 不是有效数据源，已忽略")
 
-        # 按优先级排序（Tushare 如果配置了 Token 且初始化成功，优先级为 0）
-        self._fetchers.sort(key=lambda f: f.priority)
+            if not self._fetchers:
+                logger.error("DATA_SOURCE_PRIORITY 未匹配到任何有效数据源，回退到默认配置")
+                custom_priority = ''  # 进入下面的默认分支
 
-        # 构建优先级说明
+        if not custom_priority:
+            # 默认：加载全部数据源
+            is_ci = self._is_ci_environment()
+            all_fetchers = {k: v() for k, v in fetcher_factories.items()
+                           if not (k == 'pytdx' and is_ci)}
+            if is_ci and 'pytdx' not in all_fetchers:
+                logger.info("检测到 CI 环境，跳过 PytdxFetcher（通达信服务器不可达）")
+
+            self._fetchers = sorted(all_fetchers.values(), key=lambda f: f.priority)
+
+        # 日志
         priority_info = ", ".join([f"{f.name}(P{f.priority})" for f in self._fetchers])
-        logger.info(f"已初始化 {len(self._fetchers)} 个数据源（按优先级）: {priority_info}")
+        if custom_priority:
+            logger.info(f"使用自定义数据源（排他模式）: {custom_priority} → {priority_info}")
+        else:
+            logger.info(f"已初始化 {len(self._fetchers)} 个数据源（按优先级）: {priority_info}")
     
     def add_fetcher(self, fetcher: BaseFetcher) -> None:
         """添加数据源并重新排序"""
@@ -311,36 +338,44 @@ class DataFetcherManager:
         self._fetchers.sort(key=lambda f: f.priority)
     
     def get_daily_data(
-        self, 
+        self,
         stock_code: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         days: int = 30
     ) -> Tuple[pd.DataFrame, str]:
         """
-        获取日线数据（自动切换数据源）
-        
+        获取日线数据（自动切换数据源 + 运行时熔断）
+
         故障切换策略：
         1. 从最高优先级数据源开始尝试
-        2. 捕获异常后自动切换到下一个
-        3. 记录每个数据源的失败原因
-        4. 所有数据源失败后抛出详细异常
-        
+        2. 连续失败达到阈值的数据源自动跳过（运行时熔断）
+        3. 捕获异常后自动切换到下一个
+        4. 成功后重置该数据源的失败计数
+        5. 所有数据源失败后抛出详细异常
+
         Args:
             stock_code: 股票代码
             start_date: 开始日期
             end_date: 结束日期
             days: 获取天数
-            
+
         Returns:
             Tuple[DataFrame, str]: (数据, 成功的数据源名称)
-            
+
         Raises:
             DataFetchError: 所有数据源都失败时抛出
         """
         errors = []
-        
+
         for fetcher in self._fetchers:
+            # 运行时熔断：连续失败次数达到阈值，跳过
+            fail_count = self._runtime_failures.get(fetcher.name, 0)
+            if fail_count >= self.RUNTIME_FAILURE_THRESHOLD:
+                logger.debug(f"[{fetcher.name}] 已熔断（连续失败 {fail_count} 次），跳过")
+                errors.append(f"[{fetcher.name}] 已熔断跳过（连续失败 {fail_count} 次）")
+                continue
+
             try:
                 logger.info(f"尝试使用 [{fetcher.name}] 获取 {stock_code}...")
                 df = fetcher.get_daily_data(
@@ -349,18 +384,24 @@ class DataFetcherManager:
                     end_date=end_date,
                     days=days
                 )
-                
+
                 if df is not None and not df.empty:
+                    # 成功：重置该数据源的失败计数
+                    self._runtime_failures[fetcher.name] = 0
                     logger.info(f"[{fetcher.name}] 成功获取 {stock_code}")
                     return df, fetcher.name
-                    
+
             except Exception as e:
                 error_msg = f"[{fetcher.name}] 失败: {str(e)}"
                 logger.warning(error_msg)
                 errors.append(error_msg)
-                # 继续尝试下一个数据源
+                # 累计失败次数
+                self._runtime_failures[fetcher.name] = fail_count + 1
+                new_count = self._runtime_failures[fetcher.name]
+                if new_count >= self.RUNTIME_FAILURE_THRESHOLD:
+                    logger.warning(f"[{fetcher.name}] 连续失败 {new_count} 次，后续将跳过")
                 continue
-        
+
         # 所有数据源都失败
         error_summary = f"所有数据源获取 {stock_code} 失败:\n" + "\n".join(errors)
         logger.error(error_summary)

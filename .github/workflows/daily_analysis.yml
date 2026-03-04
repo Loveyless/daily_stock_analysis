@@ -68,6 +68,9 @@ jobs:
           # 数据源
           # ==========================================
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          # 日线数据源优先级（排他模式：只启用列出的数据源）
+          # CI 环境下 efinance/akshare/pytdx 均不可用，默认只用 baostock
+          DATA_SOURCE_PRIORITY: ${{ vars.DATA_SOURCE_PRIORITY || 'baostock' }}
           
           # ==========================================
           # 搜索服务

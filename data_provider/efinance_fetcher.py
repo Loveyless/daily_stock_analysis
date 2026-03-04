@@ -197,14 +197,11 @@ class EfinanceFetcher(BaseFetcher):
         self._last_request_time = time.time()
     
     @retry(
-        stop=stop_after_attempt(5),  # 增加到5次
-        wait=wait_exponential(multiplier=1, min=4, max=60),  # 增加等待时间：4, 8, 16...
+        stop=stop_after_attempt(3),  # 从5次减到3次
+        wait=wait_exponential(multiplier=1, min=4, max=30),  # 最大等待从60s减到30s
         retry=retry_if_exception_type((
             ConnectionError,
             TimeoutError,
-            requests.exceptions.RequestException,
-            requests.exceptions.ConnectionError,
-            requests.exceptions.ChunkedEncodingError
         )),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
@@ -288,12 +285,18 @@ class EfinanceFetcher(BaseFetcher):
             
         except Exception as e:
             error_msg = str(e).lower()
-            
+
             # 检测反爬封禁
             if any(keyword in error_msg for keyword in ['banned', 'blocked', '频率', 'rate', '限制']):
                 logger.warning(f"检测到可能被封禁: {e}")
                 raise RateLimitError(f"efinance 可能被限流: {e}") from e
-            
+
+            # 连接被远端关闭 / 协议错误 — 快速失败，不重试
+            # (urllib3 内部重试已耗尽才会到这里，再做 tenacity 重试毫无意义)
+            if any(kw in error_msg for kw in ['remotedisconnected', 'protocolerror',
+                                               'connection aborted', 'max retries exceeded']):
+                raise DataFetchError(f"efinance 获取数据失败: {e}") from e
+
             raise DataFetchError(f"efinance 获取数据失败: {e}") from e
     
     def _fetch_etf_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -354,14 +357,14 @@ class EfinanceFetcher(BaseFetcher):
             
         except Exception as e:
             error_msg = str(e).lower()
-            
+
             # 检测反爬封禁
             if any(keyword in error_msg for keyword in ['banned', 'blocked', '频率', 'rate', '限制']):
                 logger.warning(f"检测到可能被封禁: {e}")
                 raise RateLimitError(f"efinance 可能被限流: {e}") from e
-            
+
             raise DataFetchError(f"efinance 获取 ETF 数据失败: {e}") from e
-    
+
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
         标准化 efinance 数据
