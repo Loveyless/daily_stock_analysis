@@ -111,6 +111,12 @@ class StockAnalysisPipeline:
         Returns:
             Tuple[是否成功, 错误信息]
         """
+        def _compact_error_message(message: str, max_len: int = 180) -> str:
+            clean = " ".join(str(message).split())
+            if len(clean) <= max_len:
+                return clean
+            return clean[:max_len] + "..."
+
         try:
             today = date.today()
             
@@ -133,8 +139,8 @@ class StockAnalysisPipeline:
             return True, None
             
         except Exception as e:
-            error_msg = f"获取/保存数据失败: {str(e)}"
-            logger.error(f"[{code}] {error_msg}")
+            error_msg = f"获取/保存数据失败: {_compact_error_message(str(e))}"
+            logger.debug(f"[{code}] 获取/保存数据失败详情: {e}", exc_info=True)
             return False, error_msg
     
     def analyze_stock(self, code: str) -> Optional[AnalysisResult]:

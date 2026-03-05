@@ -104,14 +104,25 @@ def setup_logging(debug: bool = False, log_dir: str = "./logs") -> None:
     root_logger.addHandler(debug_handler)
     
     # 降低第三方库的日志级别
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
+    logging.getLogger('urllib3').setLevel(logging.ERROR if is_ci else logging.WARNING)
+    logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR if is_ci else logging.WARNING)
     logging.getLogger('sqlalchemy').setLevel(logging.WARNING)
     logging.getLogger('google').setLevel(logging.WARNING)
     logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('yfinance').setLevel(logging.CRITICAL if is_ci else logging.ERROR)
+
+    if is_ci:
+        # CI 控制台压缩模式：保留核心流程日志，屏蔽数据源实现层的细碎 API 调用日志
+        logging.getLogger('data_provider.akshare_fetcher').setLevel(logging.WARNING)
+        logging.getLogger('data_provider.efinance_fetcher').setLevel(logging.WARNING)
+        logging.getLogger('data_provider.yfinance_fetcher').setLevel(logging.WARNING)
     
     logging.info(f"日志系统初始化完成，日志目录: {log_path.absolute()}")
     logging.info(f"常规日志: {log_file}")
     logging.info(f"调试日志: {debug_log_file}")
+    if is_ci:
+        logging.info("已启用 CI 日志压缩模式（第三方重试日志与细碎 API 调用日志已降噪）")
 
 
 logger = logging.getLogger(__name__)

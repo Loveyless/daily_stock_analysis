@@ -959,12 +959,9 @@ class GeminiAnalyzer:
             logger.info(f"[LLM配置] Prompt 长度: {len(prompt)} 字符")
             logger.info(f"[LLM配置] 是否包含新闻: {'是' if has_usable_news else '否'}")
             
-            # 记录完整 prompt 到日志（INFO级别记录摘要，DEBUG记录完整）
+            # 记录 prompt 到调试日志，避免在 CI 控制台刷大段文本
             prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
-            if self._compact_logging:
-                logger.debug(f"[LLM Prompt 预览]\n{prompt_preview}")
-            else:
-                logger.info(f"[LLM Prompt 预览]\n{prompt_preview}")
+            logger.debug(f"[LLM Prompt 预览]\n{prompt_preview}")
             logger.debug(f"=== 完整 Prompt ({len(prompt)}字符) ===\n{prompt}\n=== End Prompt ===")
 
             # 设置生成配置（从配置文件读取温度参数）
@@ -984,12 +981,9 @@ class GeminiAnalyzer:
             # 记录响应信息
             logger.info(f"[LLM返回] Gemini API 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符")
             
-            # 记录响应预览（INFO级别）和完整响应（DEBUG级别）
+            # 记录响应预览到调试日志，控制台仅保留耗时与长度
             response_preview = response_text[:300] + "..." if len(response_text) > 300 else response_text
-            if self._compact_logging:
-                logger.debug(f"[LLM返回 预览]\n{response_preview}")
-            else:
-                logger.info(f"[LLM返回 预览]\n{response_preview}")
+            logger.debug(f"[LLM返回 预览]\n{response_preview}")
             logger.debug(f"=== Gemini 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ===")
             
             # 解析响应

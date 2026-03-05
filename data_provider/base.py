@@ -280,6 +280,14 @@ class DataFetcherManager:
                 return False
         return True
 
+    @staticmethod
+    def _compact_error_message(message: str, max_len: int = 180) -> str:
+        """压缩异常文本，避免 CI 控制台刷屏。"""
+        clean = " ".join(str(message).split())
+        if len(clean) <= max_len:
+            return clean
+        return clean[:max_len] + "..."
+
     def _init_default_fetchers(self) -> None:
         """
         初始化默认数据源列表
@@ -386,7 +394,7 @@ class DataFetcherManager:
         Raises:
             DataFetchError: 所有数据源都失败时抛出
         """
-        errors = []
+        errors: List[str] = []
 
         for fetcher in self._fetchers:
             try:
@@ -403,13 +411,15 @@ class DataFetcherManager:
                     return df, fetcher.name
 
             except Exception as e:
-                error_msg = f"[{fetcher.name}] 失败: {str(e)}"
+                compact_msg = self._compact_error_message(str(e))
+                error_msg = f"[{fetcher.name}] 失败: {compact_msg}"
                 logger.warning(error_msg)
+                logger.debug(f"[{fetcher.name}] {stock_code} 失败详情: {e}", exc_info=True)
                 errors.append(error_msg)
                 continue
 
         # 所有数据源都失败
-        error_summary = f"所有数据源获取 {stock_code} 失败:\n" + "\n".join(errors)
+        error_summary = f"所有数据源获取 {stock_code} 失败（{len(errors)}个）: " + "; ".join(errors)
         logger.error(error_summary)
         raise DataFetchError(error_summary)
     
