@@ -52,6 +52,8 @@ class YfinanceFetcher(BaseFetcher):
     
     name = "YfinanceFetcher"
     priority = 4
+    SH_PREFIXES = ('600', '601', '603', '605', '688', '689', '900')
+    SZ_PREFIXES = ('000', '001', '002', '003', '200', '300', '301')
     
     def __init__(self):
         """初始化 YfinanceFetcher"""
@@ -101,15 +103,23 @@ class YfinanceFetcher(BaseFetcher):
         if '.SS' in code or '.SZ' in code or '.HK' in code:
             return code
 
-        # 去除可能的 .SH 后缀
-        code = code.replace('.SH', '')
+        # 去除可能的市场后缀
+        code = code.replace('.SH', '').replace('.SS', '').replace('.SZ', '')
 
         # A股：根据代码前缀判断市场
-        if code.startswith(('600', '601', '603', '688')):
+        if code.startswith(self.SH_PREFIXES):
             return f"{code}.SS"
-        elif code.startswith(('000', '002', '300')):
+        elif code.startswith(self.SZ_PREFIXES):
             return f"{code}.SZ"
         else:
+            if code.isdigit() and len(code) == 6:
+                if code[0] in ('5', '6', '9'):
+                    logger.warning(f"无法精确识别股票 {code} 市场，按沪市处理")
+                    return f"{code}.SS"
+                if code[0] in ('0', '1', '2', '3'):
+                    logger.warning(f"无法精确识别股票 {code} 市场，按深市处理")
+                    return f"{code}.SZ"
+
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
             return f"{code}.SZ"
     

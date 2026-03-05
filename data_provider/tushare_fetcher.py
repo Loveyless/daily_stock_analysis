@@ -53,6 +53,8 @@ class TushareFetcher(BaseFetcher):
     
     name = "TushareFetcher"
     priority = 2  # 默认优先级，会在 __init__ 中根据配置动态调整
+    SH_PREFIXES = ('600', '601', '603', '605', '688', '689', '900')
+    SZ_PREFIXES = ('000', '001', '002', '003', '200', '300', '301')
 
     def __init__(self, rate_limit_per_minute: int = 80):
         """
@@ -185,21 +187,34 @@ class TushareFetcher(BaseFetcher):
         Returns:
             Tushare 格式代码，如 '600519.SH', '000001.SZ'
         """
-        code = stock_code.strip()
-        
-        # 已经包含后缀的情况
-        if '.' in code:
-            return code.upper()
-        
+        code = stock_code.strip().upper()
+
+        # 标准后缀格式，直接返回
+        if code.endswith('.SH') or code.endswith('.SZ'):
+            return code
+
+        # sh.600519 / sz.000001 -> 600519 / 000001
+        if code.startswith('SH.') or code.startswith('SZ.'):
+            code = code.split('.', 1)[1]
+
+        # 兼容其他常见后缀
+        code = code.replace('.SS', '').replace('.SH', '').replace('.SZ', '')
+
         # 根据代码前缀判断市场
-        # 沪市：600xxx, 601xxx, 603xxx, 688xxx (科创板)
-        # 深市：000xxx, 002xxx, 300xxx (创业板)
-        if code.startswith(('600', '601', '603', '688')):
+        if code.startswith(self.SH_PREFIXES):
             return f"{code}.SH"
-        elif code.startswith(('000', '002', '300')):
+        elif code.startswith(self.SZ_PREFIXES):
             return f"{code}.SZ"
         else:
-            # 默认尝试深市
+            # 根据首位数字兜底，尽量避免错分市场
+            if code.isdigit() and len(code) == 6:
+                if code[0] in ('5', '6', '9'):
+                    logger.warning(f"无法精确识别股票 {code} 市场，按沪市处理")
+                    return f"{code}.SH"
+                if code[0] in ('0', '1', '2', '3'):
+                    logger.warning(f"无法精确识别股票 {code} 市场，按深市处理")
+                    return f"{code}.SZ"
+
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
             return f"{code}.SZ"
     

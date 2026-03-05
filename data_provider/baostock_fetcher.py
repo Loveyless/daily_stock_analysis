@@ -15,6 +15,7 @@ BaostockFetcher - 备用数据源 2 (Priority 3)
 """
 
 import logging
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, Generator
@@ -53,10 +54,15 @@ class BaostockFetcher(BaseFetcher):
     
     name = "BaostockFetcher"
     priority = 3
+
+    SH_PREFIXES = ('600', '601', '603', '605', '688', '689', '900')
+    SZ_PREFIXES = ('000', '001', '002', '003', '200', '300', '301')
     
     def __init__(self):
         """初始化 BaostockFetcher"""
         self._bs_module = None
+        # Baostock SDK 的登录态为全局资源，多线程并发登录/登出会互相干扰
+        self._session_lock = threading.Lock()
     
     def _get_baostock(self):
         """
@@ -84,29 +90,28 @@ class BaostockFetcher(BaseFetcher):
                 # 在这里执行数据查询
         """
         bs = self._get_baostock()
-        login_result = None
-        
-        try:
-            # 登录 Baostock
-            login_result = bs.login()
-            
-            if login_result.error_code != '0':
-                raise DataFetchError(f"Baostock 登录失败: {login_result.error_msg}")
-            
-            logger.debug("Baostock 登录成功")
-            
-            yield bs
-            
-        finally:
-            # 确保登出，防止连接泄露
+        with self._session_lock:
             try:
-                logout_result = bs.logout()
-                if logout_result.error_code == '0':
-                    logger.debug("Baostock 登出成功")
-                else:
-                    logger.warning(f"Baostock 登出异常: {logout_result.error_msg}")
-            except Exception as e:
-                logger.warning(f"Baostock 登出时发生错误: {e}")
+                # 登录 Baostock
+                login_result = bs.login()
+
+                if login_result.error_code != '0':
+                    raise DataFetchError(f"Baostock 登录失败: {login_result.error_msg}")
+
+                logger.debug("Baostock 登录成功")
+
+                yield bs
+
+            finally:
+                # 确保登出，防止连接泄露
+                try:
+                    logout_result = bs.logout()
+                    if logout_result.error_code == '0':
+                        logger.debug("Baostock 登出成功")
+                    else:
+                        logger.warning(f"Baostock 登出异常: {logout_result.error_msg}")
+                except Exception as e:
+                    logger.warning(f"Baostock 登出时发生错误: {e}")
     
     def _convert_stock_code(self, stock_code: str) -> str:
         """
@@ -129,14 +134,22 @@ class BaostockFetcher(BaseFetcher):
             return code.lower()
         
         # 去除可能的后缀
-        code = code.replace('.SH', '').replace('.SZ', '').replace('.sh', '').replace('.sz', '')
+        code = code.replace('.SH', '').replace('.SZ', '').replace('.SS', '').replace('.sh', '').replace('.sz', '').replace('.ss', '')
         
         # 根据代码前缀判断市场
-        if code.startswith(('600', '601', '603', '688')):
+        if code.startswith(self.SH_PREFIXES):
             return f"sh.{code}"
-        elif code.startswith(('000', '002', '300')):
+        elif code.startswith(self.SZ_PREFIXES):
             return f"sz.{code}"
         else:
+            if code.isdigit() and len(code) == 6:
+                if code[0] in ('5', '6', '9'):
+                    logger.warning(f"无法精确识别股票 {code} 市场，按沪市处理")
+                    return f"sh.{code}"
+                if code[0] in ('0', '1', '2', '3'):
+                    logger.warning(f"无法精确识别股票 {code} 市场，按深市处理")
+                    return f"sz.{code}"
+
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
             return f"sz.{code}"
     

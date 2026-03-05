@@ -264,6 +264,22 @@ class DataFetcherManager:
                          'TRAVIS', 'CIRCLECI', 'CODEBUILD_BUILD_ID']
         return any(os.getenv(var) for var in ci_indicators)
 
+    @staticmethod
+    def _is_fetcher_available(fetcher: BaseFetcher) -> bool:
+        """
+        检查数据源是否可用
+
+        约定：Fetcher 可选实现 is_available()；未实现则按可用处理。
+        """
+        checker = getattr(fetcher, 'is_available', None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception as e:
+                logger.warning(f"[{fetcher.name}] 可用性检查异常，已跳过: {e}")
+                return False
+        return True
+
     def _init_default_fetchers(self) -> None:
         """
         初始化默认数据源列表
@@ -300,7 +316,11 @@ class DataFetcherManager:
             for name in custom_priority.split(','):
                 name = name.strip().lower()
                 if name in fetcher_factories:
-                    self._fetchers.append(fetcher_factories[name]())
+                    fetcher = fetcher_factories[name]()
+                    if self._is_fetcher_available(fetcher):
+                        self._fetchers.append(fetcher)
+                    else:
+                        logger.info(f"[{fetcher.name}] 不可用，已从 DATA_SOURCE_PRIORITY 中跳过")
                 else:
                     logger.warning(f"DATA_SOURCE_PRIORITY 中的 '{name}' 不是有效数据源，已忽略")
 
@@ -311,12 +331,21 @@ class DataFetcherManager:
         if not custom_priority:
             # 默认：加载全部数据源
             is_ci = self._is_ci_environment()
-            all_fetchers = {k: v() for k, v in fetcher_factories.items()
-                           if not (k == 'pytdx' and is_ci)}
-            if is_ci and 'pytdx' not in all_fetchers:
+            all_fetchers = []
+            for name, factory in fetcher_factories.items():
+                if name == 'pytdx' and is_ci:
+                    continue
+
+                fetcher = factory()
+                if self._is_fetcher_available(fetcher):
+                    all_fetchers.append(fetcher)
+                else:
+                    logger.info(f"[{fetcher.name}] 不可用，初始化阶段已跳过")
+
+            if is_ci:
                 logger.info("检测到 CI 环境，跳过 PytdxFetcher（通达信服务器不可达）")
 
-            self._fetchers = sorted(all_fetchers.values(), key=lambda f: f.priority)
+            self._fetchers = sorted(all_fetchers, key=lambda f: f.priority)
 
         # 日志
         priority_info = ", ".join([f"{f.name}(P{f.priority})" for f in self._fetchers])
